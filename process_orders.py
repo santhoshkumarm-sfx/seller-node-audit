@@ -360,6 +360,38 @@ def blocked_fuzzy_match(orders: pd.DataFrame, aligned: pd.DataFrame,
 # --------------------------------------------------------------------------- #
 # 4. MAIN PIPELINE
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# COLUMN RESOLUTION (tolerant of real-world header naming variance)
+# --------------------------------------------------------------------------- #
+def pick_col(columns, candidates, substring_keywords=None, exclude_if_ends_with=None):
+    """
+    Resolve a logical field (e.g. "seller address") to an actual column name.
+    1. exact match, 2. case-insensitive exact match, 3. substring fallback on
+    a normalized (letters/digits only) header -- catches real variants like
+    "Seller_Address_Line1" that a fixed candidate list can't anticipate.
+    `exclude_if_ends_with` guards against a broad keyword like "address"
+    wrongly matching an identifier column such as "address_id".
+    """
+    cols = list(columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    lower = {c.lower().strip(): c for c in cols}
+    for c in candidates:
+        if c.lower() in lower:
+            return lower[c.lower()]
+    if substring_keywords:
+        norm = {c: re.sub(r"[^A-Z0-9]", "", c.upper()) for c in cols}
+        for kw in substring_keywords:
+            kw_norm = re.sub(r"[^A-Z0-9]", "", kw.upper())
+            for c, n in norm.items():
+                if kw_norm in n:
+                    if exclude_if_ends_with and any(n.endswith(s.upper()) for s in exclude_if_ends_with):
+                        continue
+                    return c
+    return None
+
+
 def run(aligned_path: str, orders_path: str, outdir: str,
         threshold: int = 90, block_len: int = 4):
     sw = Stopwatch()
@@ -375,19 +407,21 @@ def run(aligned_path: str, orders_path: str, outdir: str,
     sw.lap(f"Loaded orders created file: {len(orders):,} rows")
 
     # ---- resolve column names (tolerant of minor naming variance) -------- #
-    aligned_name_col = next((c for c in ["seller_name"] if c in aligned.columns), None)
-    aligned_addr_col = next((c for c in ["seller_addr", "seller_address"] if c in aligned.columns), None)
-    aligned_node_col = next((c for c in ["seller_node"] if c in aligned.columns), None)
-    aligned_hub_col = next((c for c in ["destination_hub", "new_hub_id"] if c in aligned.columns), None)
+    aligned_name_col = pick_col(aligned.columns, ["seller_name"], ["sellername", "name"])
+    aligned_addr_col = pick_col(aligned.columns, ["seller_addr", "seller_address"],
+                                 ["selleraddr", "address", "addr"], exclude_if_ends_with=["ID"])
+    aligned_node_col = pick_col(aligned.columns, ["seller_node"], ["sellernode", "node"])
+    aligned_hub_col = pick_col(aligned.columns, ["destination_hub", "new_hub_id"], ["destinationhub", "hub"])
 
-    order_name_col = next((c for c in ["Seller name", "Seller name ", "seller_name"] if c in orders.columns), None)
-    order_addr_col = next((c for c in ["Seller address", "seller_addr"] if c in orders.columns), None)
-    order_node_col = next((c for c in ["seller_node"] if c in orders.columns), None)
-    order_hub_col = next((c for c in ["hub"] if c in orders.columns), None)
-    order_awb_col = next((c for c in ["awb_number", "awb"] if c in orders.columns), None)
-    order_cluster_col = next((c for c in ["cluster_code"] if c in orders.columns), None)
-    aligned_client_col = next((c for c in ["client"] if c in aligned.columns), None)
-    order_client_col = next((c for c in ["client", "client_id", "Client", "name"] if c in orders.columns), None)
+    order_name_col = pick_col(orders.columns, ["Seller name", "Seller name ", "seller_name"], ["sellername", "name"])
+    order_addr_col = pick_col(orders.columns, ["Seller address", "seller_addr"],
+                               ["selleraddr", "address", "addr"], exclude_if_ends_with=["ID"])
+    order_node_col = pick_col(orders.columns, ["seller_node"], ["sellernode", "node"])
+    order_hub_col = pick_col(orders.columns, ["hub"], ["hub"])
+    order_awb_col = pick_col(orders.columns, ["awb_number", "awb"], ["awb", "trackingnumber", "tracking"])
+    order_cluster_col = pick_col(orders.columns, ["cluster_code"], ["cluster"])
+    aligned_client_col = pick_col(aligned.columns, ["client"], ["client"])
+    order_client_col = pick_col(orders.columns, ["client", "client_id", "Client", "name"], ["client"])
 
     required = {
         "sellers aligned: seller_name": aligned_name_col,
