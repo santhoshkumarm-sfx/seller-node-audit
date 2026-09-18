@@ -100,6 +100,10 @@
         <div class="text-xs font-medium text-slate-500 uppercase tracking-wide">Medium Confidence (Review)</div>
         <div id="mMedium" class="text-3xl font-bold text-indigo-600 mt-2">0</div>
       </div>
+      <div class="bg-white rounded-xl p-5 border border-slate-200 shadow-sm">
+        <div class="text-xs font-medium text-slate-500 uppercase tracking-wide">Already Exact-Aligned</div>
+        <div id="mAlreadyAligned" class="text-3xl font-bold text-slate-500 mt-2">0</div>
+      </div>
     </section>
 
     <section class="bg-white rounded-xl border border-slate-200 shadow-sm p-4 mb-4 flex flex-wrap items-center gap-3 justify-between">
@@ -212,6 +216,16 @@ const ADDR_WEIGHT = 0.70;
 // primary defense against a pathologically large blocking bucket turning
 // one order into thousands of expensive LCS comparisons.
 const MAX_CANDIDATES_PER_ORDER = 60;
+// Below this fuzzy client-name similarity (Indel/LCS ratio -- the SAME
+// exact scorer used for name/address, not the cheaper bigram-Dice proxy),
+// a candidate is excluded from consideration entirely. Client strings are
+// short (a client label, not a full address), so the full LCS cost here is
+// negligible -- using the exact scorer instead of a proxy also keeps this
+// gate's decisions identical to process_orders.py's CLIENT_GATE_THRESHOLD,
+// verified against the same real-data calibration (distinct clients like
+// Puma/Nykaa vs Flipkart scored 15-25; same-client lane-label variants
+// scored 30+).
+const CLIENT_GATE_THRESHOLD = 25;
 
 function confidenceTier(score){
   if (score >= 90) return 'High';
@@ -224,6 +238,18 @@ function confidenceTier(score){
 function normalize(v){
   if (v === null || v === undefined) return '';
   return String(v).toUpperCase().replace(/[^A-Z0-9]/g, '');
+}
+
+// Client-specific: expands the common "FK" shorthand for Flipkart (e.g.
+// "FK Seller - Large" -> "Flipkart Seller Large") seen in order-side lane
+// labels, since the abbreviated form otherwise shares too few characters
+// with the aligned master's full "Flipkart..." client name to clear the
+// fuzzy client gate below.
+function normalizeClient(v){
+  if (v === null || v === undefined) return '';
+  let s = String(v).trim();
+  s = s.replace(/^FK\b/i, 'Flipkart');
+  return s.toUpperCase().replace(/[^A-Z0-9]/g, '');
 }
 
 const ROMAN_TO_DIGIT = {
@@ -475,6 +501,7 @@ function runParse(data){
     orderAwb: pickCol(orderHeaders, ['awb_number','awb'], ['awb','trackingnumber','tracking']),
     orderCluster: pickCol(orderHeaders, ['cluster_code'], ['cluster']),
     orderClient: pickCol(orderHeaders, ['client','client_id','Client','name'], ['client']),
+    alignedPincode: pickCol(alignedHeaders, ['pincode','new_pincode','original_pincode'], ['pincode']),
   };
   const FIELD_LABELS = {
     alignedName:'Sellers Aligned: seller_name', alignedAddr:'Sellers Aligned: seller_addr',
@@ -499,22 +526,36 @@ function runParse(data){
   const alignedNorm = alignedRows.map(r=>{
     const nameNorm = normalize(r[col.alignedName]);
     const addrNorm = normalizeAddress(r[col.alignedAddr]);
+    const clientNorm = hasClientBoth ? normalizeClient(r[col.alignedClient]) : '';
     return {
-      row: r, nameNorm, addrNorm,
-      clientNorm: hasClientBoth ? normalize(r[col.alignedClient]) : '',
+      row: r, nameNorm, addrNorm, clientNorm,
       nameBigrams: bigramMultiset(nameNorm),
       addrBigrams: bigramMultiset(addrNorm),
     };
   });
-  const orderNorm = orderRows.map(r=>({
-    row: r,
-    nameNorm: normalize(r[col.orderName]),
-    addrNorm: normalizeAddress(r[col.orderAddr]),
-    clientNorm: hasClientBoth ? normalize(r[col.orderClient]) : '',
-  }));
 
-  self.postMessage({type:'progress', pct:38, message:'Handing off to matching workers...'});
-  self.postMessage({ type:'parsed', alignedNorm, orderNorm, col, hasClientBoth });
+  // Exact seller_node pre-filter (see header note): if an order's node
+  // ALREADY exactly matches some node in the aligned master, it needs no
+  // update and should never enter the fuzzy matching pipeline at all --
+  // both the correct business rule and a real performance win at 10L+ rows.
+  const alignedNodeSet = new Set(
+    alignedRows.map(r=>normalize(r[col.alignedNode])).filter(Boolean)
+  );
+
+  const orderNorm = orderRows.map(r=>{
+    const nodeNorm = normalize(r[col.orderNode]);
+    return {
+      row: r,
+      nameNorm: normalize(r[col.orderName]),
+      addrNorm: normalizeAddress(r[col.orderAddr]),
+      clientNorm: hasClientBoth ? normalizeClient(r[col.orderClient]) : '',
+      alreadyAlignedExact: nodeNorm !== '' && alignedNodeSet.has(nodeNorm),
+    };
+  });
+  const alreadyAlignedCount = orderNorm.reduce((n,o)=>n+(o.alreadyAlignedExact?1:0), 0);
+
+  self.postMessage({type:'progress', pct:38, message:alreadyAlignedCount.toLocaleString()+' orders already exact-aligned (skipped); handing off to matching workers...'});
+  self.postMessage({ type:'parsed', alignedNorm, orderNorm, col, hasClientBoth, alreadyAlignedCount });
 }
 
 /* ==========================================================================
@@ -536,59 +577,78 @@ function runMatch(data){
 
   for (let i=0; i<total; i++){
     const order = orderSlice[i];
-    const namePrefix = order.nameNorm.slice(0, blockLen);
-    const addrPrefix = order.addrNorm.slice(0, blockLen);
-    // Bigram maps for THIS order, built once and reused for every
-    // candidate it's compared against (not rebuilt per-candidate).
-    const orderNameBigrams = bigramMultiset(order.nameNorm);
-    const orderAddrBigrams = bigramMultiset(order.addrNorm);
-    const orderNameBigramTotal = order.nameNorm.length > 1 ? order.nameNorm.length - 1 : 0;
-    const orderAddrBigramTotal = order.addrNorm.length > 1 ? order.addrNorm.length - 1 : 0;
+    const orderRow = order.row;
 
-    const candidateSet = new Set();
-    (alignedByName.get(namePrefix) || []).forEach(idx=>candidateSet.add(idx));
-    (alignedByAddr.get(addrPrefix) || []).forEach(idx=>candidateSet.add(idx));
-
-    // Hard cap on candidates evaluated per order. Blocking usually keeps
-    // buckets tiny, but a common address/name prefix (a big city name, a
-    // generic "PLOT"/"SECTOR" opener, etc.) can legitimately produce a
-    // bucket of thousands of aligned rows -- verified against a real
-    // aligned file, where the largest bucket held 3000+ candidates.
-    let candidates = candidateSet;
-    if (candidateSet.size > MAX_CANDIDATES_PER_ORDER){
-      candidates = new Set(Array.from(candidateSet).slice(0, MAX_CANDIDATES_PER_ORDER));
-    }
-
+    // Exact seller_node pre-filter: this row already has a valid aligned
+    // node, so it never enters matching -- but cluster-code-missing is
+    // independent and still needs to run on it below.
     let bestCombined = -1, bestName = 0, bestAddr = 0, bestAligned = null;
-    candidates.forEach(idx=>{
-      const cand = alignedNorm[idx];
 
-      // Gate 1 (cheapest, O(1)): length-based upper bound.
-      const nameUB = maxPossibleRatio(order.nameNorm.length, cand.nameNorm.length);
-      const addrUB = maxPossibleRatio(order.addrNorm.length, cand.addrNorm.length);
-      if (combinedUpperBound(nameUB, addrUB) < 60) return;
+    if (!order.alreadyAlignedExact){
+      const namePrefix = order.nameNorm.slice(0, blockLen);
+      const addrPrefix = order.addrNorm.slice(0, blockLen);
+      // Bigram maps for THIS order, built once and reused for every
+      // candidate it's compared against (not rebuilt per-candidate).
+      const orderNameBigrams = bigramMultiset(order.nameNorm);
+      const orderAddrBigrams = bigramMultiset(order.addrNorm);
+      const orderNameBigramTotal = order.nameNorm.length > 1 ? order.nameNorm.length - 1 : 0;
+      const orderAddrBigramTotal = order.addrNorm.length > 1 ? order.addrNorm.length - 1 : 0;
 
-      // Gate 2 (cheap, O(n+m)): bigram Dice as a fast proxy for the real
-      // score, with a safety margin (40 instead of 60) so its imprecision
-      // relative to the true LCS-based score can't cause a skip of a
-      // genuine match. Only candidates that clear THIS gate pay for the
-      // O(n*m) exact LCS below.
-      const candAddrTotal = cand.addrNorm.length > 1 ? cand.addrNorm.length - 1 : 0;
-      const quickAddr = quickDice(orderAddrBigrams, orderAddrBigramTotal, cand.addrBigrams, candAddrTotal);
-      // Optimistic combined score: assume a PERFECT name match (100) plus
-      // the cheap address estimate. If even that can't clear 50 (a 10-point
-      // safety margin below the real 60 "Low" floor, to absorb the gap
-      // between Dice and the real LCS-based score), this candidate is not
-      // worth the expensive exact scoring below.
-      if (NAME_WEIGHT * 100 + ADDR_WEIGHT * quickAddr < 50) return;
+      const candidateSet = new Set();
+      (alignedByName.get(namePrefix) || []).forEach(idx=>candidateSet.add(idx));
+      (alignedByAddr.get(addrPrefix) || []).forEach(idx=>candidateSet.add(idx));
 
-      const nameScore = fuzzRatio(order.nameNorm, cand.nameNorm);
-      const addrScore = fuzzRatio(order.addrNorm, cand.addrNorm);
-      const combined = NAME_WEIGHT*nameScore + ADDR_WEIGHT*addrScore;
-      if (combined > bestCombined){
-        bestCombined = combined; bestName = nameScore; bestAddr = addrScore; bestAligned = cand;
+      // Hard cap on candidates evaluated per order. Blocking usually keeps
+      // buckets tiny, but a common address/name prefix (a big city name, a
+      // generic "PLOT"/"SECTOR" opener, etc.) can legitimately produce a
+      // bucket of thousands of aligned rows -- verified against a real
+      // aligned file, where the largest bucket held 3000+ candidates.
+      let candidates = candidateSet;
+      if (candidateSet.size > MAX_CANDIDATES_PER_ORDER){
+        candidates = new Set(Array.from(candidateSet).slice(0, MAX_CANDIDATES_PER_ORDER));
       }
-    });
+
+      candidates.forEach(idx=>{
+        const cand = alignedNorm[idx];
+
+        // Gate 0 (hard): client must clear the fuzzy client gate, or this
+        // candidate is never eligible at all -- e.g. a Puma order can
+        // never match a Flipkart aligned record, no matter how good the
+        // name/address score looks. Uses the exact LCS scorer (client
+        // strings are short, so this is cheap) to match
+        // process_orders.py's decisions exactly.
+        if (hasClientBoth){
+          const clientScore = fuzzRatio(order.clientNorm, cand.clientNorm);
+          if (clientScore < CLIENT_GATE_THRESHOLD) return;
+        }
+
+        // Gate 1 (cheapest, O(1)): length-based upper bound.
+        const nameUB = maxPossibleRatio(order.nameNorm.length, cand.nameNorm.length);
+        const addrUB = maxPossibleRatio(order.addrNorm.length, cand.addrNorm.length);
+        if (combinedUpperBound(nameUB, addrUB) < 60) return;
+
+        // Gate 2 (cheap, O(n+m)): bigram Dice as a fast proxy for the real
+        // score, with a safety margin (40 instead of 60) so its imprecision
+        // relative to the true LCS-based score can't cause a skip of a
+        // genuine match. Only candidates that clear THIS gate pay for the
+        // O(n*m) exact LCS below.
+        const candAddrTotal = cand.addrNorm.length > 1 ? cand.addrNorm.length - 1 : 0;
+        const quickAddr = quickDice(orderAddrBigrams, orderAddrBigramTotal, cand.addrBigrams, candAddrTotal);
+        // Optimistic combined score: assume a PERFECT name match (100) plus
+        // the cheap address estimate. If even that can't clear 50 (a 10-point
+        // safety margin below the real 60 "Low" floor, to absorb the gap
+        // between Dice and the real LCS-based score), this candidate is not
+        // worth the expensive exact scoring below.
+        if (NAME_WEIGHT * 100 + ADDR_WEIGHT * quickAddr < 50) return;
+
+        const nameScore = fuzzRatio(order.nameNorm, cand.nameNorm);
+        const addrScore = fuzzRatio(order.addrNorm, cand.addrNorm);
+        const combined = NAME_WEIGHT*nameScore + ADDR_WEIGHT*addrScore;
+        if (combined > bestCombined){
+          bestCombined = combined; bestName = nameScore; bestAddr = addrScore; bestAligned = cand;
+        }
+      });
+    }
 
     const tier = bestAligned ? confidenceTier(bestCombined) : 'None';
     if (tier === 'High') highCount++;
@@ -601,8 +661,9 @@ function runMatch(data){
     const alignedHub = (highConfidence || mediumConfidence) ? bestAligned.row[col.alignedHub] : null;
     const alignedNode = (highConfidence || mediumConfidence) ? bestAligned.row[col.alignedNode] : null;
     const alignedAddr = (highConfidence || mediumConfidence) ? bestAligned.row[col.alignedAddr] : null;
+    const alignedPincode = (highConfidence || mediumConfidence) && col.alignedPincode ? bestAligned.row[col.alignedPincode] : null;
+    const alignedClient = (highConfidence || mediumConfidence) && col.alignedClient ? bestAligned.row[col.alignedClient] : null;
 
-    const orderRow = order.row;
     const orderHubNorm = normalize(orderRow[col.orderHub]);
     const alignedHubNorm = alignedHub !== null ? normalize(alignedHub) : '';
     const hubAlreadyAligned = highConfidence && orderHubNorm !== '' && orderHubNorm === alignedHubNorm;
@@ -612,13 +673,12 @@ function runMatch(data){
 
     if (highConfidence && nodeDiffers && !hubAlreadyAligned){
       pincodeCount++;
+      // Per business direction: this output is an action list, not a full
+      // audit record -- destination pincode + client only. (Full detail is
+      // still available via the manual-review/consolidated views.)
       pincodeRows.push({
-        seller_node: alignedNode,
-        'Seller name': orderRow[col.orderName],
-        'Seller address': orderRow[col.orderAddr],
-        awb_number: orderRow[col.orderAwb],
-        hub: orderRow[col.orderHub],
-        destination_hub: alignedHub,
+        destination_pincode: alignedPincode,
+        client: alignedClient !== null ? alignedClient : orderRow[col.orderClient],
       });
     } else if (mediumConfidence && nodeDiffers &&
                !(orderHubNorm !== '' && orderHubNorm === alignedHubNorm)){
@@ -758,7 +818,7 @@ document.getElementById('runBtn').addEventListener('click', async ()=>{
       parseWorker.terminate();
     } else if (msg.type === 'parsed'){
       parseWorker.terminate();
-      runMatchPool(msg.alignedNorm, msg.orderNorm, msg.col, msg.hasClientBoth);
+      runMatchPool(msg.alignedNorm, msg.orderNorm, msg.col, msg.hasClientBoth, msg.alreadyAlignedCount);
     }
   };
   parseWorker.postMessage({
@@ -768,7 +828,7 @@ document.getElementById('runBtn').addEventListener('click', async ()=>{
   }, [alignedBuffer, ordersBuffer]);
 });
 
-function runMatchPool(alignedNorm, orderNorm, col, hasClientBoth){
+function runMatchPool(alignedNorm, orderNorm, col, hasClientBoth, alreadyAlignedCount){
   const total = orderNorm.length;
   const poolSize = Math.min(POOL_SIZE, Math.max(1, Math.ceil(total / 2000))); // don't over-split tiny files
   const chunkSize = Math.ceil(total / poolSize);
@@ -814,7 +874,7 @@ function runMatchPool(alignedNorm, orderNorm, col, hasClientBoth){
         doneCount++;
         worker.terminate();
         if (doneCount === poolSize && !failed){
-          finishMatching(results, col);
+          finishMatching(results, col, alreadyAlignedCount);
         }
       }
     };
@@ -831,7 +891,7 @@ function emptyMatchResult(){
            highCount:0, mediumCount:0, lowCount:0, pincodeCount:0, clusterMissingCount:0, hubAlignedCount:0, total:0 };
 }
 
-function finishMatching(results, col){
+function finishMatching(results, col, alreadyAlignedCount){
   setProgress(96, 'Merging results and building CSV files...');
 
   const merged = emptyMatchResult();
@@ -846,7 +906,7 @@ function finishMatching(results, col){
     totalOrders += r.total;
   });
 
-  const pincodeCsv = toCSVMain(merged.pincodeRows, ['seller_node','Seller name','Seller address','awb_number','hub','destination_hub']);
+  const pincodeCsv = toCSVMain(merged.pincodeRows, ['destination_pincode','client']);
   const clusterCsv = toCSVMain(merged.clusterRows, ['awb_number','seller_node','Seller name','Seller address','hub','cluster_code']);
   const manualReviewCsv = toCSVMain(merged.manualReviewRows, [
     'confidence_tier','combined_match_score','name_match_score','address_match_score',
@@ -867,6 +927,7 @@ function finishMatching(results, col){
       pincodeUpdateRequired: merged.pincodeCount,
       hubAlreadyAligned: merged.hubAlignedCount,
       clusterMissing: merged.clusterMissingCount,
+      alreadyAlignedExact: alreadyAlignedCount || 0,
     },
     pincodeRows: merged.pincodeRows,
     clusterRows: merged.clusterRows,
@@ -911,6 +972,7 @@ function onResults(msg){
   document.getElementById('mPincode').textContent = msg.summary.pincodeUpdateRequired.toLocaleString();
   document.getElementById('mCluster').textContent = msg.summary.clusterMissing.toLocaleString();
   document.getElementById('mMedium').textContent = msg.summary.mediumConfidence.toLocaleString();
+  document.getElementById('mAlreadyAligned').textContent = (msg.summary.alreadyAlignedExact||0).toLocaleString();
 
   document.getElementById('results').classList.remove('hidden');
   renderTable();
@@ -919,7 +981,7 @@ function onResults(msg){
 
 /* ---------------- Tabs ---------------- */
 const TAB_COLUMNS = {
-  pincode: ['seller_node','Seller name','Seller address','awb_number','hub','destination_hub'],
+  pincode: ['destination_pincode','client'],
   cluster: ['awb_number','seller_node','Seller name','Seller address','hub','cluster_code'],
   manual: ['confidence_tier','combined_match_score','aligned_seller_node_id','order_seller_node_id',
            'Seller name','Order Seller address','Aligned Seller address','awb_number','hub','destination_hub'],
